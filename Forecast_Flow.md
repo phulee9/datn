@@ -39,7 +39,7 @@ Dự báo tổng lượng bán trong `horizon` ngày tới, kèm dự báo từn
   "sku": "COCA_330",
   "store_id": 1,
   "horizon_days": 7,
-  "method": "lightgbm",
+  "method": "catboost",
   "predicted_quantity": 232.5,
   "daily": [30.1, 31.5, 29.8, 33.2, 36.4, 38.7, 32.8],
   "range_low": 195.0,
@@ -67,10 +67,10 @@ flowchart TD
     D -- "Dưới 7 ngày" --> E["Từ chối dự báo\nTrả lỗi thiếu dữ liệu"]
     D -- "Từ 7 ngày trở lên" --> F["Tạo lag / rolling features"]
     F --> G["Baseline thống kê\nSeasonal Naive + Moving Average"]
-    F --> H["LightGBM regression\nModel chính"]
-    G --> I["So sánh backtest\nMAE / WAPE"]
+    F --> H["GBDT benchmark\nXGBoost + LightGBM + CatBoost"]
+    G --> I["Rolling-origin backtest\nMAE / WAPE"]
     H --> I
-    I --> J["Chọn kết quả theo method\nTrả kèm baseline để đối chứng"]
+    I --> J["Chọn model có MAE thấp nhất\nTrả kèm baseline để đối chứng"]
     J --> K["Forecast API trả JSON\ncho Dashboard / Orchestrator"]
 
     style A fill:#E8F0FE,stroke:#2563EB,color:#111827
@@ -88,9 +88,9 @@ flowchart TD
 | 1 | Đọc lịch sử bán | `COCA_330` tại cửa hàng 1, 90 ngày | Chuỗi `date → qty` |
 | 2 | Làm sạch chuỗi | Điền ngày thiếu bằng 0 hoặc nội suy | Chuỗi liên tục, không thủng ngày |
 | 3 | Kiểm tra độ dài | `len(history) < 7` thì từ chối | Tránh dự báo từ dữ liệu quá ít |
-| 4 | Tạo feature | `lag_1`, `lag_7`, `roll_mean_7`, `weekday` | Bảng train cho LightGBM |
+| 4 | Tạo feature | `lag_1`, `lag_7`, `roll_mean_7`, `weekday` | Bảng train cho các model GBDT |
 | 5 | Chạy baseline | Seasonal Naive 7 ngày, MA7 | Kết quả đối chứng |
-| 6 | Chạy LightGBM | Train regression theo bảng feature | Dự báo từng ngày |
+| 6 | Chạy GBDT | Train XGBoost, LightGBM, CatBoost trên cùng feature | Dự báo từng ngày |
 | 7 | Backtest | Rolling-origin trên 14–30 ngày cuối | MAE, WAPE của từng phương pháp |
 | 8 | API trả kết quả | `GET /api/forecast?sku=COCA_330` | JSON dự báo và khoảng dao động |
 
@@ -98,7 +98,7 @@ flowchart TD
 
 ## 5. Vì sao phải biến chuỗi thời gian thành bảng?
 
-LightGBM không đọc trực tiếp chuỗi ngày tháng. Cần chuyển mỗi ngày thành một dòng gồm các đặc trưng lấy từ quá khứ.
+Các model GBDT không đọc trực tiếp chuỗi ngày tháng. Cần chuyển mỗi ngày thành một dòng gồm các đặc trưng lấy từ quá khứ.
 
 Ví dụ lịch sử:
 
@@ -125,7 +125,7 @@ is_weekend = 0
 target = 32
 ```
 
-Nhờ đó LightGBM học được các mẫu như:
+Nhờ đó các model GBDT học được các mẫu như:
 
 ```text
 Cuối tuần bán cao hơn ngày thường.
@@ -156,11 +156,11 @@ Moving Average 7 ngày: trung bình 7 ngày gần nhất.
 - Chạy được với 7–30 ngày dữ liệu.
 - Không cần train.
 - Rất dễ giải thích khi bảo vệ.
-- Nếu LightGBM không thắng baseline thì kết quả chưa đáng tin.
+- Nếu model GBDT thắng không hơn baseline thì kết quả chưa đáng tin.
 
-### 6.2. Model chính: LightGBM regression
+### 6.2. Nhóm model GBDT đem benchmark
 
-LightGBM học quan hệ giữa các lag/rolling features và lượng bán tương lai.
+XGBoost, LightGBM và CatBoost cùng học quan hệ giữa các lag/rolling features và lượng bán tương lai. Model triển khai chỉ được chọn sau rolling-origin backtest.
 
 Feature đề xuất:
 
@@ -175,16 +175,17 @@ price, promotion_flag (nếu có)
 store_id, sku (mã hóa category nếu train chung nhiều SKU)
 ```
 
-Ưu điểm so với Prophet ở giai đoạn MVP:
+Ưu điểm của nhóm GBDT so với Prophet ở giai đoạn MVP:
 
 - Train và inference nhanh.
-- Một model có thể dùng chung cho nhiều SKU/cửa hàng.
+- Có thể train một global model dùng chung cho nhiều SKU/cửa hàng.
 - Dễ thêm giá, khuyến mãi, lễ, thứ trong tuần.
 - Không yêu cầu chuỗi 6–12 tháng mới chạy ổn định.
+- CatBoost xử lý category native; LightGBM ưu tiên tốc độ; XGBoost là mốc GBDT ổn định.
 
 ### 6.3. Vì sao chưa dùng Prophet?
 
-| Tiêu chí | Baseline + LightGBM | Prophet |
+| Tiêu chí | Baseline + GBDT benchmark | Prophet |
 |---|---|---|
 | Dữ liệu tối thiểu | 7 ngày đã chạy được | Nên có từ 60 ngày trở lên |
 | Mùa vụ tuần/lễ | Học qua `lag_7`, `is_holiday` | Học tốt nhưng cần lịch sử dài |
@@ -194,7 +195,7 @@ store_id, sku (mã hóa category nếu train chung nhiều SKU)
 
 Kết luận dùng trong báo cáo:
 
-> Prophet được để dành cho giai đoạn 2, khi có trên 60 ngày dữ liệu liên tục. Ở MVP, LightGBM với lag features làm model chính, Seasonal Naive/Moving Average làm baseline.
+> Prophet được để dành cho giai đoạn 2, khi có trên 60 ngày dữ liệu liên tục. Ở MVP, benchmark XGBoost, LightGBM và CatBoost với lag features; Seasonal Naive/Moving Average làm baseline. Model có MAE backtest thấp nhất được triển khai.
 
 ---
 
@@ -257,13 +258,13 @@ sequenceDiagram
     actor Manager as Quản lý / Dashboard
     participant API as Forecast API
     participant Data as sales_daily.csv<br/>hoặc PostgreSQL sau này
-    participant Model as Baseline + LightGBM
+    participant Model as Baseline + model thắng benchmark
 
     Manager->>API: GET /api/forecast?sku=COCA_330&store_id=1&horizon=7
     API->>Data: Lấy chuỗi date → qty
     Data-->>API: Lịch sử bán theo ngày
     API->>API: Kiểm tra tối thiểu 7 ngày
-    API->>Model: Tạo features + chạy baseline và LightGBM
+    API->>Model: Tạo features + chạy baseline và model đã chọn
     Model-->>API: Dự báo từng ngày + MAE backtest
     API->>API: Tổng hợp predicted_quantity và range_low/high
     API-->>Manager: JSON forecast
@@ -284,7 +285,7 @@ sequenceDiagram
     "mae_backtest": 5.8
   },
   "model": {
-    "method": "lightgbm",
+    "method": "catboost",
     "predicted_quantity": 232.5,
     "daily": [30.1, 31.5, 29.8, 33.2, 36.4, 38.7, 32.8],
     "range_low": 195.0,
@@ -308,26 +309,25 @@ history = load_daily_sales(sku="COCA_330", store_id=1)
 if len(history) < 7:
     return {"error": "Chưa đủ lịch sử bán hàng, cần tối thiểu 7 ngày."}
 
-# 3. Tạo lag/rolling features cho LightGBM.
+# 3. Tạo lag/rolling features dùng chung cho GBDT.
 features = build_time_features(history)
 
-# 4. Baseline thống kê.
-baseline_forecast = seasonal_naive(history, horizon_days=7)
+# 4. Chạy Seasonal Naive và 3 GBDT trên cùng backtest folds.
+methods = ["seasonal_naive", "xgboost", "lightgbm", "catboost"]
+results = rolling_origin_backtest(methods, history, horizon_days=7)
 
-# 5. Train/predict bằng LightGBM.
-model = train_lightgbm(features)
-model_forecast = model.predict_next_days(horizon_days=7)
+# 5. Chọn model có MAE trung bình thấp nhất.
+winner = choose_lowest_mae(results)
 
-# 6. Backtest rolling-origin.
-baseline_mae = backtest(baseline_fn, history)
-model_mae = backtest(lightgbm_fn, history)
+# 6. Retrain winner bằng toàn bộ history rồi forecast N ngày.
+model_forecast = recursive_forecast(winner, history, horizon_days=7)
 
-# 7. Trả kết quả so sánh.
+# 7. Trả forecast cùng kết quả benchmark.
 return {
-    "baseline": baseline_forecast,
+    "baseline": results["seasonal_naive"],
     "model": model_forecast,
-    "baseline_mae": baseline_mae,
-    "model_mae": model_mae,
+    "benchmark": results,
+    "method": winner,
 }
 ```
 
@@ -361,7 +361,7 @@ flowchart LR
         F --> B
     end
 
-    B --> G["Baseline + LightGBM"]
+    B --> G["Baseline + GBDT benchmark\nXGBoost/LightGBM/CatBoost"]
     G --> H["Dự báo N ngày tới"]
 
     style B fill:#E8F0FE,stroke:#2563EB,color:#111827
@@ -375,4 +375,4 @@ flowchart LR
 
 ## 12. Kết luận trình bày trong nhóm
 
-> Module Forecast dự báo lượng bán theo từng cửa hàng và SKU trong N ngày tới. Mỗi ngày được chuyển thành một dòng feature gồm lag, trung bình trượt, thứ trong tuần và tín hiệu lễ/khuyến mãi. Seasonal Naive và Moving Average làm baseline; LightGBM regression làm model chính. Kết quả được đánh giá bằng MAE/WAPE trên rolling-origin backtest. Ở MVP, dữ liệu là CSV mô phỏng; khi ingestion hoàn thiện, chỉ cần thay nguồn dữ liệu bằng tổng hợp `receipt_items` theo ngày, không cần thay thuật toán.
+> Module Forecast dự báo lượng bán theo từng cửa hàng và SKU trong N ngày tới. Mỗi ngày được chuyển thành một dòng feature gồm lag, trung bình trượt, thứ trong tuần và tín hiệu lễ/khuyến mãi. Seasonal Naive và Moving Average làm baseline; XGBoost, LightGBM và CatBoost được benchmark công bằng. Model chính là model có MAE thấp nhất qua rolling-origin backtest, đồng thời phải đối chiếu với baseline bằng WAPE. Ở MVP, dữ liệu là CSV mô phỏng; khi ingestion hoàn thiện, chỉ cần thay nguồn dữ liệu bằng tổng hợp `receipt_items` theo ngày rồi chạy benchmark lại.
