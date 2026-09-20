@@ -1,0 +1,9 @@
+version: 2
+sources:
+  - name: landing
+    schema: staging
+    tables:
+      - name: product
+      - name: transaction
+      - name: receipt
+      - name: receipt_item

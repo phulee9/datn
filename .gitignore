@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+artifacts/forecast/*.joblib
+storage/receipts/raw/*
+!storage/receipts/raw/.gitkeep
+*.ipynb_checkpoints/
+*.csv
+agent-dashboard/data/
+_probe/
+data/

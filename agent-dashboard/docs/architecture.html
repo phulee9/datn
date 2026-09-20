@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Agent Dashboard - Kiến trúc Data Lakehouse</title>
+<style>
+  :root{--blue:#1e3a5f;--red:#c0392b;--line:#94a3b8;--bg:#f8fafc;--card:#ffffff;--muted:#64748b}
+  *{box-sizing:border-box;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  body{margin:0;background:var(--bg);color:#0f172a}
+  .wrap{max-width:1280px;margin:24px auto;padding:0 16px}
+  h1{margin:0;font-size:18px;letter-spacing:.04em}
+  .bar{background:var(--blue);color:#fff;text-align:center;padding:10px;border-radius:10px 10px 0 0;font-weight:800}
+  .frame{border:2px solid #1e3a5f;border-radius:12px;overflow:hidden;background:#fff}
+  .grid{display:grid;grid-template-columns:170px 1fr 1.35fr 160px;gap:0}
+  .col{border-right:2px solid #e2e8f0;padding:14px}
+  .col:last-child{border-right:none}
+  .col-title{font-weight:800;font-size:12px;color:#fff;text-align:center;padding:7px;border-radius:8px;margin-bottom:12px}
+  .t-blue{background:#2563eb}.t-red{background:var(--red)}.t-slate{background:#334155}.t-teal{background:#0f766e}
+  .box{background:var(--card);border:1px solid #e2e8f0;border-radius:12px;padding:10px;margin-bottom:10px;box-shadow:0 1px 2px rgba(0,0,0,.06)}
+  .box b{font-size:12px}.box p{margin:6px 0 0;font-size:11px;color:var(--muted);line-height:1.4}
+  .pill{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:999px;background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;margin:2px 3px 0 0}
+  .pill.gold{background:#fef9c3;color:#854d0e;border-color:#fde68a}
+  .pill.silver{background:#f1f5f9;color:#334155;border-color:#cbd5e1}
+  .arrow{position:relative;height:28px;display:flex;align-items:center;justify-content:center;color:var(--line);font-size:11px}
+  .arrow:before{content:"";position:absolute;left:12px;right:12px;top:50%;height:2px;background:var(--line)}
+  .arrow:after{content:"▶";position:absolute;right:2px;top:50%;transform:translateY(-50%);font-size:11px}
+  .vwrap{display:flex;flex-direction:column;gap:10px}
+  .legend{margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;font-size:11px;color:var(--muted)}
+  .legend span{display:flex;align-items:center;gap:6px}
+  .dot{width:10px;height:10px;border-radius:50%}
+  .note{margin-top:14px;background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px;font-size:11px;color:#334155;line-height:1.6}
+  .small{font-size:11px;color:#475569}
+  @media(max-width:980px){.grid{grid-template-columns:1fr}.col{border-right:none;border-bottom:2px solid #e2e8f0}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div style="display:flex;justify-content:space-between;align-items:end;gap:12px;margin-bottom:12px">
+    <div>
+      <h1>AGENT DASHBOARD — KIẾN TRÚC DATA LAKEHOUSE (ĐÃ CHỐT)</h1>
+      <div class="small">MinIO raw -> PostgreSQL staging / silver / gold (dbt) -> Airflow điều phối -> CatBoost Forecast · Không dim_date · dih_fetch_day/month/year ở mọi bảng dữ liệu</div>
+    </div>
+    <div class="small" style="text-align:right">FastAPI + Gemini Vision · dbt PostgreSQL · Airflow 2.10<br/>MinIO S3-compatible · CatBoost native categorical</div>
+  </div>
+
+  <div class="frame">
+    <div class="bar">DATA LAKEHOUSE &nbsp;·&nbsp; MINIO (RAW) &nbsp;→&nbsp; POSTGRESQL (WAREHOUSE + DATAMART) &nbsp;→&nbsp; TRỰC QUAN HÓA</div>
+    <div class="grid">
+      <!-- NGUỒN -->
+      <div class="col">
+        <div class="col-title t-blue">NGUỒN DỮ LIỆU</div>
+        <div class="box"><b>Dunnhumby CSV</b><p>product.csv<br/>transaction_data.csv</p><span class="pill">2.6M rows raw</span></div>
+        <div class="box"><b>Ảnh hóa đơn</b><p>Upload qua FastAPI<br/>JPEG / PNG / WebP</p><span class="pill">SHA-256 dedupe</span></div>
+        <div class="box" style="border-style:dashed"><b>Gemini Vision</b><p>Đọc ảnh -> ReceiptExtract<br/>validator + SKU mapper</p></div>
+        <div style="margin-top:10px" class="small">FastAPI ghi <b>staging</b> trực tiếp; dbt chỉ transform.</div>
+      </div>
+
+      <!-- RAW / STAGING -->
+      <div class="col">
+        <div class="col-title t-red">RAW / STAGING — MINIO + STAGING</div>
+        <div class="box" style="border-color:#fecaca;background:#fef2f2"><b style="color:#991b1b">MINIO</b>
+          <p><b>receipts-raw</b><br/><span style="font-family:monospace">s3://receipts-raw/YYYY/MM/DD/&lt;uuid&gt;.jpg</span></p>
+          <p><b>dunnhumby-raw</b> (deploy)<br/>product.csv / transaction_data.csv</p>
+        </div>
+        <div class="arrow">FastAPI put / get bytes</div>
+        <div class="box"><b>staging.product</b><p>PK product_id · dih_fetch_*</p></div>
+        <div class="box"><b>staging.transaction</b><p>PK transaction_id · basket_id/store_id/product_id · dih_fetch_*</p></div>
+        <div class="box"><b>staging.receipt</b> <span class="pill">lifecycle</span><p>image_hash UNIQUE · image_uri s3:// · status pending/processing/confirmed/needs_review/error · raw_json JSONB · dih_fetch_*</p></div>
+        <div class="box"><b>staging.receipt_item</b><p>product_id nullable · match_method/score · dih_fetch_*</p></div>
+        <div class="small">Airflow <b>không</b> trigger lúc upload — chỉ khi <b>confirmed</b>.</div>
+      </div>
+
+      <!-- DWH -->
+      <div class="col">
+        <div class="col-title t-slate">DWH — PostgreSQL</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div>
+            <div class="box" style="background:#f0fdf4;border-color:#bbf7d0"><b>WAREHOUSE — silver</b><p>Canonical, chỉ confirmed mới vào fact</p></div>
+            <div class="vwrap">
+              <div class="box"><b>silver.dim_store</b> <span class="pill silver">id / source_code UNIQUE</span><p>store_name · dih_fetch_*</p></div>
+              <div class="box"><b>silver.dim_product</b> <span class="pill silver">id / sku UNIQUE</span><p>display_name · category · brand · product_size · dih_fetch_*</p></div>
+              <div class="box"><b>silver.dim_product_alias</b><p>normalized_alias UNIQUE · học từ review</p></div>
+              <div class="box"><b>silver.fact_receipt</b><p>staging_receipt_id UNIQUE · receipt_date · total_amount · raw_json · dih_fetch_*</p></div>
+              <div class="box"><b>silver.fact_receipt_item</b><p>receipt_id FK · product_id FK · quantity · dih_fetch_*</p></div>
+            </div>
+          </div>
+          <div>
+            <div class="box" style="background:#eff6ff;border-color:#bfdbfe"><b>DATAMART — gold</b><p>Vật lý, phục vụ Forecast</p></div>
+            <div class="vwrap">
+              <div class="box"><b>gold.mart_daily_sales</b> <span class="pill gold">TABLE</span><p>PK (business_date, store_id, product_id)<br/>quantity · amount · dih_fetch_*</p></div>
+              <div class="box"><b>gold.mart_forecast_features</b> <span class="pill gold">TABLE</span><p>lag_1/7/14 · rolling_mean/std_7<br/>weekday · is_weekend · <span style="white-space:nowrap">ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING</span></p></div>
+              <div class="box" style="border-style:dashed"><b>gold.v_forecast_input</b> <span class="pill">VIEW</span><p>SELECT * FROM mart_forecast_features<br/>WHERE lag_* IS NOT NULL</p></div>
+              <div class="box"><b>public.forecast_training_runs</b> <span class="pill">metadata</span><p>business_date_to · receipt_count · metrics JSONB · dih_fetch_*</p></div>
+            </div>
+          </div>
+        </div>
+        <div class="arrow" style="margin-top:8px">dbt build &nbsp;·&nbsp; silver: table &nbsp;·&nbsp; gold: table + view</div>
+        <div class="small" style="margin-top:6px"><b>Điều phối:</b> Airflow <code>receipt_transform_dag</code> (trigger bởi FastAPI khi confirmed) → <code>forecast_train_dag</code> (schedule = Dataset gold.v_forecast_input)</div>
+      </div>
+
+      <!-- TRỰC QUAN -->
+      <div class="col">
+        <div class="col-title t-teal">TRỰC QUAN HÓA</div>
+        <div class="box"><b>Forecast API</b><p><code>POST /api/forecast/train</code><br/><code>GET /api/forecast?sku=&store_id=&horizon_days=</code></p><span class="pill">CatBoost native</span> <span class="pill">store_id/sku/category</span></div>
+        <div class="box"><b>Artifact</b><p>artifacts/forecast/global_model.joblib<br/>method=catboost · metrics</p></div>
+        <div class="box"><b>Power BI / Dashboard</b><p>Đọc gold.mart_daily_sales<br/>và v_forecast_input</p></div>
+        <div class="box" style="background:#f8fafc"><b>DBeaver</b><p>localhost:5432<br/>app / password</p></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><i class="dot" style="background:#c0392b"></i> Raw / Staging</span>
+    <span><i class="dot" style="background:#334155"></i> Warehouse (silver)</span>
+    <span><i class="dot" style="background:#2563eb"></i> Datamart (gold)</span>
+    <span><i class="dot" style="background:#0f766e"></i> Consumption</span>
+  </div>
+
+  <div class="note">
+    <b>Quy ước đã chốt:</b> Không <code>dim_date</code>; mọi bảng staging/silver/gold có <code>dih_fetch_day/month/year SMALLINT NOT NULL</code> là ngày pipeline ghi dữ liệu (không phải <code>receipt_date/business_date</code>).<br/>
+    <b>Luồng:</b> Dunnhumby CSV / ảnh upload → MinIO + staging (FastAPI) → dbt silver (top 15 stores / 150 SKU) → gold mart_daily_sales → gold mart_forecast_features (zero-fill + lag/rolling, không rò rỉ CURRENT ROW) → Airflow trigger → CatBoost train → Forecast API.<br/>
+    <b>Dedup ảnh:</b> <code>staging.receipt.image_hash = SHA-256(bytes)</code> UNIQUE → upload trùng trả HTTP 409.
+  </div>
+</div>
+</body>
+</html>
