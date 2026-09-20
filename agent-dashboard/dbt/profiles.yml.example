@@ -1,0 +1,12 @@
+agent_dashboard:
+  target: docker
+  outputs:
+    docker:
+      type: postgres
+      host: "{{ env_var('DBT_POSTGRES_HOST', 'postgres') }}"
+      port: "{{ env_var('DBT_POSTGRES_PORT', '5432') | int }}"
+      user: "{{ env_var('DBT_POSTGRES_USER', 'app') }}"
+      password: "{{ env_var('DBT_POSTGRES_PASSWORD', 'password') }}"
+      dbname: "{{ env_var('DBT_POSTGRES_DATABASE', 'agent_dashboard') }}"
+      schema: staging
+      threads: 4
