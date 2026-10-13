@@ -1,232 +1,147 @@
-# Kiến Trúc Pipeline Ingestion — Hệ Thống Phân Tích Hóa Đơn WinMart
+# Pipeline Ingestion — WinMart
 
-> **Phạm vi:** Tài liệu này mô tả **kiến trúc ingestion** từ điểm đã có sẵn parquet. Giả định `raw/*.parquet` và `receipts.jsonl → invoices/invoice_items.parquet` đã được gen (tiền xử lý, streaming, không thuộc luồng incremental này). Từ đây thiết kế **luồng append từ ảnh hóa đơn → Silver → Gold → Serving**, kèm **công nghệ dùng ở từng đoạn**, **cách lưu trữ** và **chiến lược incremental**. Tên bảng là **ví dụ** (có thể đổi khi gen data), schema tương tự.
+> **Giả định:** Toàn bộ dữ liệu đầu vào đã có sẵn **dạng parquet**. `raw/fake_receipts.jsonl` đã được tách thành hai bảng **invoices** (1 dòng/hóa đơn) và **invoice_items** (1 dòng/dòng hàng) kèm các bảng liên quan (`categories`, `products`, `stores`, `raw_receipts`), lưu dạng **parquet**. Tài liệu này **chỉ thiết kế luồng từ đây trở đi**. Tên bảng trong tài liệu là **ví dụ tạm** (có thể đổi khi gen data), schema tương tự.
 
----
-
-## 1. Tổng Quan Kiến Trúc
+## 1. Trạng Thái Đầu Vào (đã có sẵn)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        NGUỒN CÓ SẴN (tiền xử lý)                        │
-│  raw/categories.parquet (92)  raw/products.parquet (3062)               │
-│  raw/fake_receipts.jsonl (20M) ──streaming──► dataset_for_ai/*.parquet  │
-│       1 dòng = 1 JSON OCR ──► invoices (20M) + invoice_items (70M)      │
-└──────────────────────────────┬──────────────────────────────────────────┘
-                               │  (đã có sẵn, không thiết kế lại)
-                               ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│  ẢNH HÓA ĐƠN MỚI ──► OCR (Gemini Vision) ──► MinIO Bronze (json)        │
-│                              append hourly                               │
-│  Bronze ──► Silver (MinIO + Iceberg, partitioned) ──► Gold (ClickHouse) │
-│               ▲ Airflow + Spark/dbt              ▲ Airflow daily        │
-│                                                                     │    │
-│  Serving: Text-to-SQL / Forecast / Combo ──► Gold only (<30ms)      │    │
-│              FastAPI + Redis cache                                   │    │
-└─────────────────────────────────────────────────────────────────────────┘
+raw/  (local, đã có)
+  categories.parquet       — 92 dòng (taxonomy WinMart, 20 L1 + 72 L2)
+  products.parquet         — 3062 dòng (dedup theo item_no, join category_code 100%)
+  raw_receipts.parquet     — N dòng (1 dòng = 1 JSON OCR gốc, để audit & replay)
+  invoices.parquet         — N dòng (1 dòng = 1 hóa đơn: invoice_id, purchase_datetime, purchase_date, store_code, total_amount, ...)
+  invoice_items.parquet    — N×avg 3.5 dòng (1 dòng = 1 dòng hàng: invoice_id, line_no, item_no, category_code, quantity, line_total, match_status)
+
+→ Đã flatten, đã JOIN products để lấy item_no/category_code, đã tách purchase_date.
+→ Tài liệu này coi như 5 file parquet trên đã sẵn sàng, không thiết kế lại bước gen.
 ```
 
-**Ba lớp lưu trữ:**
+Sau khi có parquet, toàn bộ được đẩy lên **MinIO `s3://lake/bronze/`** làm điểm bắt đầu cho pipeline incremental.
 
-| Lớp | Vai Trò | Lưu Ở Đâu | Format |
-|---|---|---|---|
-| **Bronze (Raw)** | Giữ nguyên như nguồn, để audit & replay | **MinIO** `s3://lake/bronze/` | `jsonl.gz` (OCR) + `parquet` (batch gen) |
-| **Silver** | Chuẩn hóa, JOIN, dedup, partition | **MinIO + Iceberg** `s3://lake/silver/` | **Parquet partitioned by `purchase_date`**, `zstd`, file 128–256MB |
-| **Gold** | Agg sẵn cho AI, query <50ms | **ClickHouse** `gold.*` + **Redis** | `MergeTree` + cache TTL 1h |
-
----
-
-## 2. Công Nghệ Và Vai Trò
-
-| Công Nghệ | Vai Trò Trong Pipeline | Không Làm Gì |
-|---|---|---|
-| **MinIO** | Object storage rẻ — đĩa cho mọi file (thay `crawl_winmart/raw/` local). Lưu `jsonl.gz`, `parquet`, `Iceberg metadata`. | Không transform, không query |
-| **Apache Iceberg** | Table format trên MinIO — biến thư mục parquet rời rạc thành **bảng có transaction**. Cho `INSERT 1 file 50KB` không đụng 700M cũ, `MERGE/DELETE` khi sửa OCR, `snapshot` rollback, `partition` theo `purchase_date`. | Không lưu data, chỉ `metadata.json + manifest` |
-| **Apache Spark** | **Batch ETL** — transform nặng `Bronze 18G → Silver 70M` (dedup 6068→3062, JOIN `fact × dim`, normalize). Chạy 1 lần/ngày, 5–10 phút. | Không serve AI (startup 10–20s, chậm cho <100ms) |
-| **Trino** | **Interactive query** — đọc Iceberg/MinIO bằng SQL như Postgres. Dùng cho `dbt run`, ad-hoc `SELECT * FROM silver WHERE purchase_date='2026-10-12'`, drill-down hiếm. Pushdown chỉ scan 1 partition. | Không làm ETL nặng tốt bằng Spark |
-| **dbt** | **Quản lý SQL** — viết `models/silver/invoice_items.sql` thay vì `spark_job.py`. Tự `incremental` (`WHERE purchase_date > max`), tự `test` (`unique, not_null`), tự `docs` lineage. | Không schedule, không lưu data. Dưới 5 model có thể bỏ, dùng Spark SQL thuần. |
-| **ClickHouse** | **OLAP cho Gold** — bảng nhỏ `mart_daily_sales` (1.8k dòng) cần **<20–30ms, QPS cao**. Columnar, `MergeTree`, nén 10×. | Không lưu Raw/Silver (18G raw để trong CH đắt) |
-| **Redis** | **Cache nóng** — `GET mart_daily_sales:2026-01` TTL 1h. Text-to-SQL hit 80% → **<5ms**. | Không lưu fact |
-| **Apache Airflow** | **Scheduler** — gọi `dbt run` theo giờ/ngày, `OPTIMIZE` weekly, alert khi fail. | Không transform |
-
----
-
-## 3. Lưu Trữ Chi Tiết
-
-### 3.1. Bronze — MinIO `s3://lake/bronze/`
+## 2. Tổng Quan Luồng
 
 ```
-s3://lake/bronze/
-├── categories/
-│   └── categories.parquet              (92 dòng, 1 file)
-├── products/
-│   └── products.parquet                (3062 dòng, 1 file)
-├── receipts/
-│   ├── purchase_date=2026-10-12/
-│   │   ├── batch_001.jsonl.gz          (ảnh OCR batch, append = thêm file)
-│   │   └── batch_002.jsonl.gz
-│   └── purchase_date=2026-10-11/
-│       └── batch_001.jsonl.gz
-└── raw_receipts/
-    └── raw_receipts.parquet            (1 dòng = 1 JSON OCR gốc, để audit)
+[Parquet có sẵn] ──────────────────────────────┐
+  categories / products / invoices /            │
+  invoice_items / raw_receipts (parquet)        │
+                                               ├─→ MinIO Bronze (parquet, đã có)
+[Ảnh hóa đơn mới] → OCR (Gemini Vision) ──→ MinIO Bronze (parquet, append theo purchase_date)
+                                               │
+                                               ├─→ Silver (MinIO + Iceberg, partitioned purchase_date)
+                                               │     Airflow + Spark/dbt — hourly
+                                               │
+                                               ├─→ Gold (ClickHouse + Redis)
+                                               │     Airflow — daily 02:00
+                                               │
+                                               └─→ Serving: Text-to-SQL / Forecast / Combo
+                                                     FastAPI → Gold only (<30ms)
 ```
 
-- **Ghi:** `PUT s3://lake/bronze/receipts/purchase_date=2026-10-12/004.json` — mỗi ảnh 1 file nhỏ, không ghi đè.
-- **Đọc:** Spark/Trino `read_json("s3://lake/bronze/receipts/purchase_date=2026-10-12/*.json")`.
+Ba lớp lưu trữ:
 
-### 3.2. Silver — MinIO + Iceberg `s3://lake/silver/` (partitioned)
+| Lớp | Vai trò | Lưu ở đâu | Format |
+|-----|---------|-----------|--------|
+| **Bronze** | Giữ nguyên như nguồn, để audit & replay. Parquet có sẵn coi như Bronze. | **MinIO** `s3://lake/bronze/` | `parquet` (`zstd`), partitioned `purchase_date` |
+| **Silver** | Chuẩn hóa, dedup, JOIN, partition. Bảng lớn (~70M dòng). | **MinIO + Iceberg** `s3://lake/silver/` | `parquet` partitioned `purchase_date`, `zstd`, 128–256MB/file, Iceberg manifest/snapshot |
+| **Gold** | Tổng hợp sẵn, AI chỉ đọc Gold. | **ClickHouse** `gold.*` + **Redis** | `MergeTree` + cache TTL 1h |
 
-```
-s3://lake/silver/
-├── categories/                         (dim, không partition, 1 file)
-│   └── data/00001.parquet
-│   └── metadata/metadata.json
-├── products/                           (dim, không partition, 1 file)
-│   └── data/00001.parquet
-├── invoices/                           (fact, partitioned)
-│   ├── purchase_date=2026-10-12/
-│   │   └── data/00001.parquet  (30k hóa đơn, ~5MB, zstd)
-│   ├── purchase_date=2026-10-11/
-│   │   └── data/00001.parquet
-│   └── metadata/  (Iceberg: metadata.json, manifest, snapshot)
-└── invoice_items/                      (fact, partitioned, 70M dòng)
-    ├── purchase_date=2026-10-12/
-    │   └── data/00001.parquet  (100k dòng, ~8MB)
-    └── metadata/
-```
+## 3. Công Nghệ Theo Đoạn Luồng
 
-- **Partition:** `purchase_date` (YYYY-MM-DD). Mỗi ngày 1 thư mục, chứa 1–2 file 128–256MB. Query `WHERE purchase_date='2026-10-12'` chỉ scan 1 thư mục (pushdown).
-- **Compression:** `zstd` (tốt hơn `snappy` 20% cho số liệu, nén 5–8×).
-- **Iceberg:** Mỗi `INSERT` ghi 1 file parquet mới + cập nhật `manifest` (không rewrite file cũ). Hỗ trợ `MERGE INTO` khi sửa hóa đơn OCR sai.
+| Đoạn luồng | Công nghệ | Vai trò | Lưu trữ |
+|------------|-----------|---------|---------|
+| **OCR** — Ảnh JPG/PNG → JSON OCR | **Gemini Vision** (VLM, schema `ReceiptExtract`), `validator` (check `total_amount`, `ocr_confidence`), `SKU mapper` (`exact → normalized`) | Trích 1 ảnh thành 1 JSON OCR | Ghi MinIO `s3://lake/bronze/receipts/purchase_date=2026-10-12/004.parquet` (1 row = 1 JSON, `zstd`) |
+| **Bronze** — Parquet có sẵn | **MinIO** (S3 API) | Đĩa rẻ cho file lớn (10GB), append = ghi thêm file vào partition ngày đó | `s3://lake/bronze/{categories,products,invoices,invoice_items,raw_receipts}/` |
+| **Silver — Transform** | **Spark** (batch nặng: `read → dedup → explode → JOIN broadcast(products) → write`) | Xử lý 10GB → 70M dòng, không OOM | Ghi **MinIO + Iceberg** `s3://lake/silver/{invoices,invoice_items}/purchase_date=*/ *.parquet` |
+| **Silver — Quản lý bảng** | **Iceberg** (table format) | Biến thư mục parquet thành bảng có transaction: `MERGE` 1 hóa đơn sửa chỉ ghi 1 file mới + manifest, `snapshot` rollback | `metadata.json` + `manifest` trên MinIO |
+| **Silver — Query & dbt** | **Trino** (engine cho dbt) + **dbt** (quản lý SQL, `incremental`, `test`, `docs`) | `dbt run --select silver` sinh `MERGE INTO lake.silver.*`, Trino thực thi trên Iceberg; ad-hoc `SELECT * FROM silver WHERE purchase_date='...'` pushdown chỉ scan 1 file | Đọc Iceberg qua manifest, không kéo cả 70M về worker |
+| **Gold — Tổng hợp** | **Spark SQL** `GROUP BY purchase_date, category_code` | Agg Silver 70M → Gold 1.8k dòng | `INSERT INTO ClickHouse gold.mart_*` |
+| **Gold — Lưu & Cache** | **ClickHouse** (`MergeTree ORDER BY (purchase_date, category_code)`) + **Redis** (TTL 1h) | Gold nhỏ, cần <30ms, QPS cao | ClickHouse `gold.*` + Redis `GET mart_daily_sales:2026-01` |
+| **Điều phối** | **Airflow** (DAG `hourly: bronze→silver`, `daily 02:00: silver→gold`, `weekly: OPTIMIZE`) | `S3KeySensor`, `spark_submit`, `dbt run`, `dbt test`, `OPTIMIZE` | — |
+| **Serving** | **FastAPI** → Gold only | Text-to-SQL / Forecast / Combo không scan Silver | <30ms (ClickHouse) / <5ms (Redis hit) |
 
-### 3.3. Gold — ClickHouse `gold.*` + Redis
+> **Khi nào cần Iceberg/Trino/dbt?** Dưới ~20M và chỉ append (không sửa OCR) thì **plain partitioned parquet** (`mode("append").partitionBy(...)`) + Spark/Python đã append được, chưa cần Iceberg/Trino/dbt. Trên 20M hoặc cần `MERGE/DELETE` khi sửa OCR thì mới cần.
+
+## 4. Luồng Incremental — Ảnh Hóa Đơn Mới
 
 ```
-ClickHouse (MergeTree):
-  gold.mart_daily_sales      (purchase_date, category_code, total_qty, revenue, invoice_cnt)  ~1.8k dòng
-  gold.mart_store_sales      (purchase_date, store_code, revenue, invoice_cnt)               ~15k dòng
-  gold.mart_combo_rules      (antecedent, consequent, support, confidence, lift)              ~5k dòng
-  gold.mart_forecast_features (purchase_date, category_code, lag_7, rolling_7, event_flag)   ~10k dòng
+Ảnh JPG/PNG (upload, ~1s/ảnh)
+  → Gemini Vision → JSON OCR (invoice_id, purchase_datetime, store_code, items[])
+  → validator (check total_amount, ocr_confidence) → SKU mapper (name → item_no)
+  → MinIO: s3://lake/bronze/receipts/purchase_date=2026-10-12/005.parquet
+       (1 row = 1 JSON OCR, zstd, append = thêm file)
 
-Redis:
-  mart_daily_sales:2026-01  → JSON (TTL 1h)
-  mart_combo: MENU01145     → JSON (TTL 1h)
+Airflow hourly — bronze → silver (incremental, partition purchase_date):
+  Spark/Trino đọc  s3://lake/bronze/receipts/purchase_date={{ds}}/*.parquet  (chỉ ngày {{ds}}, không đọc 10GB cũ)
+    → explode items → JOIN products (broadcast 3062) → MERGE INTO lake.silver.invoice_items
+  Ghi: s3://lake/silver/invoice_items/purchase_date=2026-10-12/00002.parquet (5MB) + Iceberg manifest  (<2s, không đụng 9.9GB cũ)
+
+Airflow daily 02:00 — silver → gold:
+  Spark đọc  s3://lake/silver/invoice_items/purchase_date={{ds}}/*.parquet
+    → GROUP BY purchase_date, category_code → INSERT INTO ClickHouse gold.mart_daily_sales
+  + FP-Growth batch → gold.mart_combo_rules (precompute, không chạy trong request)
 ```
 
-- ClickHouse `MergeTree` với `ORDER BY (purchase_date, category_code)` — query theo ngày/category scan 1 granule.
-- Redis cache 80% hit cho Text-to-SQL câu lặp (`doanh thu tháng 1?`).
+## 5. Danh Mục Bảng (ví dụ tên, có thể đổi)
 
----
-
-## 4. Luồng Chi Tiết — Đoạn Nào Dùng Gì
-
-### 4.1. Luồng Batch Có Sẵn (tiền xử lý, đã chạy)
-
-| Đoạn | Input → Output | Công Nghệ | Lưu Trữ | Ghi Chú |
-|---|---|---|---|---|
-| **Gen** | `raw/categories.csv + raw/products.csv` → `raw/fake_receipts.jsonl` | **Python** `gen_fake_receipts.ipynb` (thuần `category_code`, 15 basket, 11 affinity, event động theo năm, `WRITE_CHUNK_SIZE=5000`, `APPEND_MODE`) | Local `raw/fake_receipts.jsonl` → upload `s3://lake/bronze/receipts/` | Streaming, không gom 20M vào RAM |
-| **Export** | `raw/fake_receipts.jsonl` → `invoices + invoice_items` parquet | **Python** `export_parquet_for_ai.ipynb` (`ParquetWriter` streaming, mỗi 5000 hóa đơn = 1 row group, `zstd`) | `dataset_for_ai/*.parquet` hoặc `s3://lake/silver/` (nếu lên MinIO) | Streaming, không gom 70M dòng |
-
-### 4.2. Luồng Incremental — Ảnh Hóa Đơn Mới
-
-| Đoạn | Input → Output | Công Nghệ | Lưu Trữ | Tần Suất |
-|---|---|---|---|---|
-| **1. OCR** | `Ảnh JPG/PNG (upload)` → `JSON OCR` | **Gemini Vision** (VLM, structured output `ReceiptExtract`), `validator` (check `total_amount`, `ocr_confidence`), `SKU mapper` (`exact → normalized → fuzzy`) | `MinIO` `s3://lake/bronze/receipts/purchase_date=2026-10-12/004.json` | Mỗi ảnh (~1s) |
-| **2. Bronze → Silver** | `s3://lake/bronze/receipts/purchase_date=2026-10-12/*.json` → `s3://lake/silver/invoices/` + `invoice_items/` | **Spark** (hoặc **Trino + dbt incremental** nếu model <5) — `spark.read.json → dedup → JOIN products → write` | **MinIO + Iceberg** `purchase_date=2026-10-12/00001.parquet` + manifest | **Hourly** (Airflow) |
-| **3. Silver → Gold** | `s3://lake/silver/invoice_items/` → `gold.mart_daily_sales` | **Spark SQL** `GROUP BY purchase_date, category_code` → `INSERT INTO ClickHouse` | **ClickHouse** `gold.*` | **Daily 02:00** |
-| **4. Combo** | `silver/invoice_items` (basket theo `invoice_id`) → `gold.mart_combo_rules` | **Spark** batch **FP-Growth** (`mlxtend`, precompute, không chạy trong request) | **ClickHouse** | **Daily** (sau Gold) |
-| **5. Compact** | Nhiều file nhỏ 50KB → 1 file 128MB | **Iceberg** `CALL system.rewrite_data_files` + **ClickHouse** `OPTIMIZE` | MinIO + ClickHouse | **Weekly** |
-
-### 4.3. Luồng Serving — AI Query (chỉ đọc Gold)
-
-| Model | Query | Công Nghệ Đọc | Bảng Đọc | Latency |
-|---|---|---|---|---|
-| **Text-to-SQL** | `doanh thu tháng 1?` | **Redis** (hit) → **ClickHouse** (miss) | `gold.mart_daily_sales` | **<5ms / 15–30ms** |
-| **Forecast** | `dự báo 30 ngày tới?` | **ClickHouse** `mart_daily_sales` + `mart_forecast_features` (Prophet/MA, batch precompute, không train trong request) | `gold.mart_*` | **40–70ms** |
-| **Combo** | `mua mì thì mua gì kèm?` | **ClickHouse** `mart_combo_rules` (precompute) | `gold.mart_combo_rules` | **<20ms** |
-| **Drill-down** (hiếm) | `SELECT * FROM invoice_items LIMIT 10` | **Trino** đọc Iceberg Silver | `s3://lake/silver/invoice_items/` | **200–400ms** |
-
-> **Nguyên tắc:** AI **không bao giờ** `SELECT SUM(line_total) FROM invoice_items GROUP BY` trên 70M dòng runtime. Gold đã `GROUP BY` sẵn.
-
----
-
-## 5. Bảng Silver — Schema Ví Dụ (có thể đổi tên)
-
-> Tên bảng là **ví dụ minh họa**, gen data có thể đặt `dim_*/fact_*` — schema tương tự.
-
-| Bảng | Khóa | Cột Chính | Dòng (20M) | Partition |
-|---|---|---|---|---|
-| `products` | `item_no PK` | `name, brand_name, category_code FK, category_name, final_price, uom_name` | 3062 | Không |
-| `categories` | `category_code PK` | `category_name, level (1/2), parent_code, root_code` | 92 | Không |
-| `invoices` | `invoice_id PK` | `purchase_datetime, purchase_date, store_code FK, cashier_id, total_discount, total_amount, item_count` | 20M | `purchase_date` |
-| `invoice_items` | `(invoice_id, line_no) PK` | `item_no FK (NULL nếu unmatched), product_name_raw, quantity, unit_price, discount, line_total, match_status` | ~70M | `purchase_date` |
+| Bảng (ví dụ) | Khóa | Cột chính | Dòng (20M) | Partition | Lưu |
+|--------------|------|-----------|------------|-----------|-----|
+| `categories` | `category_code PK` | `category_name, level (1/2), parent_code, root_code` | 92 | Không | MinIO Bronze → Silver (1 file) |
+| `products` | `item_no PK` | `name, brand_name, category_code FK, category_name, final_price, uom_name` | 3062 | Không | MinIO Bronze → Silver (1 file) |
+| `stores` | `store_code PK` | `store_name, region` | 7 | Không | MinIO Silver (seed) |
+| `raw_receipts` | `invoice_id PK` | `extracted_json` (JSON gốc), `ocr_confidence` | N | `purchase_date` | MinIO Bronze (audit) |
+| `invoices` | `invoice_id PK` | `purchase_datetime, purchase_date, store_code FK, cashier_id, total_discount, total_amount, item_count` | 20M | `purchase_date` | **MinIO + Iceberg** Silver |
+| `invoice_items` | `(invoice_id, line_no) PK` | `item_no FK (NULL nếu unmatched), product_name_raw, quantity, unit_price, discount, line_total, match_status` | ~70M | `purchase_date` | **MinIO + Iceberg** Silver |
+| `mart_daily_sales` | `(purchase_date, category_code)` | `total_qty, revenue, invoice_cnt` | ~1.8k | Không (ClickHouse) | **ClickHouse Gold** |
+| `mart_combo_rules` | `(antecedent, consequent)` | `support, confidence, lift` | ~5k | Không | **ClickHouse Gold** |
 
 - `match_status`: `exact` / `normalized` / `unmatched`.
-- Không lưu `brand/category` lặp trong fact → JOIN `products` khi query.
-- `purchase_date` là cột partition (YYYY-MM-DD), cũng là `ORDER BY` trong ClickHouse Gold.
-
----
+- `purchase_date` (YYYY-MM-DD) là cột partition Silver, cũng là `ORDER BY` trong ClickHouse Gold.
 
 ## 6. Orchestration (Airflow)
 
 ```
-DAG: winmart_ingestion  (hourly: Silver, daily: Gold, weekly: compact)
+DAG: ingestion  (hourly: Silver, daily: Gold, weekly: compact)
 
-hourly_silver:
-  bronze_sensor (S3KeySensor: s3://lake/bronze/receipts/purchase_date={{ds}}/*)
-    → spark_submit (Spark: bronze → silver incremental, partition purchase_date)
-    → dbt run --select silver  (nếu dùng dbt-trino/spark, materialized='incremental', unique_key=['invoice_id','line_no'])
-    → dbt test (unique, not_null, relationships)
+hourly_silver (mỗi giờ):
+  S3KeySensor(s3://lake/bronze/receipts/purchase_date={{ds}}/*)
+    → spark_submit — bronze/{{ds}} → silver/invoice_items/purchase_date={{ds}}/ (Spark, broadcast JOIN, Iceberg MERGE)
+    → dbt run --select silver  (nếu dùng dbt-trino: incremental, unique_key=['invoice_id','line_no'], partition_by=['purchase_date'])
+    → dbt test  (unique, not_null, relationships)
 
 daily_gold (02:00):
-  silver_sensor (Iceberg snapshot)
-    → spark_submit (GROUP BY → mart_daily_sales)
-    → clickhouse_insert (INSERT INTO gold.mart_daily_sales)
-    → spark_submit (FP-Growth → mart_combo_rules)
-    → redis_invalidate (DEL mart_daily_sales:*)
+  Iceberg snapshot sensor
+    → spark_submit — GROUP BY purchase_date, category_code → INSERT INTO ClickHouse gold.mart_daily_sales
+    → spark_submit — FP-Growth → gold.mart_combo_rules
+    → redis_invalidate — DEL mart_daily_sales:*
 
-weekly_compact (Sunday 03:00):
+weekly_compact (Chủ nhật 03:00):
   → Iceberg: CALL system.rewrite_data_files(table=>'silver.invoice_items', strategy=>'sort', sort_order=>'purchase_date')
   → ClickHouse: OPTIMIZE TABLE gold.mart_daily_sales FINAL
 ```
 
-- Dưới 5 model Silver/Gold: bỏ `dbt`, dùng `PythonOperator` + `spark.sql()` trong Airflow là đủ gọn.
-- Trino chỉ cần nếu muốn ad-hoc `SELECT * FROM silver` không qua ClickHouse.
+Dưới 5 model: bỏ `dbt`, dùng `PythonOperator` + `spark.sql()` trong Airflow là đủ gọn. Trino chỉ cần nếu muốn ad-hoc `SELECT * FROM silver` không qua ClickHouse.
 
----
+## 7. Hiệu Năng (20M ≈ 70M dòng fact, 10GB)
 
-## 7. Hiệu Năng Với 20M (70M dòng fact)
-
-| Thao Tác | MinIO + Iceberg (Silver) | ClickHouse (Gold) |
-|---|---|---|
-| 1 json mới (OCR) → Silver | 1 file 50KB + manifest, **<2s**, không đụng 700M cũ | — |
-| 1000 json/giờ (batch) | 1 file 5MB, **2–5s** | — |
-| Build Gold daily (GROUP BY 1 partition) | — | **<10s** (100k dòng) |
-| AI: `doanh thu tháng 1?` | — | **15–30ms** (ClickHouse) / **<5ms** (Redis hit) |
-| Drill-down `SELECT * FROM invoice_items LIMIT 10` | Trino 200–400ms (1 partition) | — |
+| Thao tác | Silver (MinIO + Iceberg) | Gold (ClickHouse) |
+|----------|--------------------------|-------------------|
+| 1 ảnh mới → Silver | 1 file 50KB + manifest, **<2s** | — |
+| 1000 ảnh/giờ (batch) | 1 file 5MB, **2–5s** | — |
+| Build Gold daily (GROUP BY 1 partition ~100k dòng) | — | **<10s** |
+| AI: `doanh thu tháng 1?` | — | **15–30ms** / **<5ms** (Redis hit) |
+| Drill-down `SELECT * FROM invoice_items LIMIT 10` | **200–400ms** (Trino, 1 partition) | — |
 
 > Nếu Silver là **1 file parquet 700MB không partition** thì append phải đọc/ghi lại cả file → **30–60s**. Partition là bắt buộc.
 
----
-
-## 8. Query Mẫu (đọc Gold, không đọc Silver runtime)
+## 8. Query Mẫu (chỉ đọc Gold, không đọc Silver runtime)
 
 ```sql
--- Forecast: doanh thu theo ngày + category (Gold)
-SELECT purchase_date, category_code, SUM(revenue) FROM gold.mart_daily_sales GROUP BY 1,2;
+-- Doanh thu theo ngày + category (Gold, <30ms)
+SELECT purchase_date, category_code, revenue FROM gold.mart_daily_sales GROUP BY 1,2;
 
--- Combo: đã precompute
+-- Combo đã precompute
 SELECT antecedent, consequent, support, confidence FROM gold.mart_combo_rules WHERE antecedent = 'MENU01145' ORDER BY lift DESC LIMIT 10;
 
--- Text-to-SQL: sản phẩm rẻ nhất (Gold/Silver nhỏ)
+-- Sản phẩm rẻ nhất
 SELECT item_no, name, final_price FROM products WHERE category_code = 'MENU01133' ORDER BY final_price LIMIT 5;
 ```
-
----
-
-## 9. Ghi Chú
-
-- Parquet có sẵn là **điểm bắt đầu** của tài liệu này. Gen (`raw/fake_receipts.jsonl` → `dataset_for_ai/*.parquet`) đã streaming (`WRITE_CHUNK_SIZE=5000`, `ParquetWriter` mỗi 5000 hóa đơn = 1 row group, `zstd`) nên 20M không OOM — nhưng đó là **tiền xử lý**, không thuộc luồng incremental này.
-- Tên bảng `products/categories/invoices/invoice_items` là ví dụ, có thể đổi thành `dim_*/fact_*` khi gen — schema và luồng không đổi.
-- Thay `ClickHouse` bằng `Postgres` vẫn chạy được nếu Gold <10M dòng, nhưng ClickHouse nhanh hơn 3–4× cho Gold và QPS cao.
-- Dưới ~5M hóa đơn có thể dùng **plain partitioned parquet** (không Iceberg) vẫn append được. Trên 20M hoặc cần `MERGE/DELETE` khi sửa OCR thì mới cần Iceberg.
